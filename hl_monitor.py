@@ -111,6 +111,9 @@ def scan_funding_extremes(assets, threshold=0.03):
         # Negative funding extreme — long opportunity
         if funding < -threshold:
             conviction = min(90, 50 + abs(funding) * 500 + (oi_usd / 10_000_000) * 10)
+            # Penalize if squeeze already played out (price already moved >8% in our direction)
+            if a["chg24h"] > 8:
+                conviction = max(30, conviction - 30)
             signals.append({
                 "strategy": "funding_squeeze_long",
                 "asset": a["name"],
@@ -132,6 +135,8 @@ def scan_funding_extremes(assets, threshold=0.03):
         # Positive funding extreme — short opportunity  
         elif funding > threshold:
             conviction = min(90, 50 + abs(funding) * 500 + (oi_usd / 10_000_000) * 10)
+            if a["chg24h"] < -8:
+                conviction = max(30, conviction - 30)
             signals.append({
                 "strategy": "funding_squeeze_short",
                 "asset": a["name"],
@@ -266,12 +271,12 @@ def scan_premium_divergence(assets):
         
         premium = a["premium"]  # already in %
         
-        if premium < -0.05:  # significant discount
+        if premium < -0.15:  # significant discount (tightened from -0.05)
             signals.append({
                 "strategy": "premium_discount_long",
                 "asset": a["name"],
                 "direction": "long",
-                "signal_strength": min(70, 40 + abs(premium) * 500),
+                "signal_strength": min(80, 40 + abs(premium) * 200),
                 "premium_pct": premium,
                 "funding_8h": a["funding8h"],
                 "mark": a["mark"],
