@@ -91,6 +91,63 @@ def save_snapshot(assets):
     
     return path
 
+def calc_dynamic_sl_tp(direction, mark, funding_pct, chg24h, strategy):
+    """
+    Calculate dynamic SL/TP based on asset volatility and strategy.
+    Returns (sl_pct, tp_pct, sl_price, tp_price).
+    
+    Logic:
+    - Base SL/TP from strategy type
+    - Widen SL if asset is volatile (large 24h move)
+    - Widen TP if funding is extreme (more room for squeeze)
+    - TP:SL ratio should always be >= 2:1
+    """
+    volatility = abs(chg24h)
+    funding_intensity = abs(funding_pct)
+    
+    # Base values per strategy
+    strategy_params = {
+        "funding_squeeze_long":      {"sl_base": 2.0, "tp_base": 5.0},
+        "funding_squeeze_short":     {"sl_base": 2.0, "tp_base": 5.0},
+        "leverage_flush_reversal":   {"sl_base": 2.5, "tp_base": 6.0},
+        "short_squeeze_momentum":    {"sl_base": 3.0, "tp_base": 8.0},
+        "capitulation_reversal":     {"sl_base": 4.0, "tp_base": 10.0},
+        "premium_discount_long":     {"sl_base": 1.5, "tp_base": 3.0},
+    }
+    params = strategy_params.get(strategy, {"sl_base": 2.5, "tp_base": 5.0})
+    
+    sl_pct = params["sl_base"]
+    tp_pct = params["tp_base"]
+    
+    # Volatility adjustment: if 24h move > 5%, widen SL by proportional amount
+    if volatility > 5:
+        vol_adj = (volatility - 5) * 0.3  # 30% of excess volatility
+        sl_pct += vol_adj
+        tp_pct += vol_adj * 2  # keep R:R attractive
+    
+    # Funding intensity: extreme funding = more squeeze room = widen TP
+    if funding_intensity > 0.05:
+        funding_adj = (funding_intensity - 0.05) * 20  # scale up
+        tp_pct += min(funding_adj, 5.0)  # cap at +5% extra TP
+    
+    # Enforce minimum 2:1 R:R
+    if tp_pct / sl_pct < 2.0:
+        tp_pct = sl_pct * 2.0
+    
+    # Round nicely
+    sl_pct = round(sl_pct, 1)
+    tp_pct = round(tp_pct, 1)
+    
+    # Calculate actual price levels
+    if direction == "long":
+        sl_price = round(mark * (1 - sl_pct / 100), 6)
+        tp_price = round(mark * (1 + tp_pct / 100), 6)
+    else:
+        sl_price = round(mark * (1 + sl_pct / 100), 6)
+        tp_price = round(mark * (1 - tp_pct / 100), 6)
+    
+    return sl_pct, tp_pct, sl_price, tp_price
+
 def scan_funding_extremes(assets, threshold=0.03):
     """
     Strategy: Extreme funding rates indicate crowding.
@@ -111,9 +168,10 @@ def scan_funding_extremes(assets, threshold=0.03):
         # Negative funding extreme — long opportunity
         if funding < -threshold:
             conviction = min(90, 50 + abs(funding) * 500 + (oi_usd / 10_000_000) * 10)
-            # Penalize if squeeze already played out (price already moved >8% in our direction)
             if a["chg24h"] > 8:
                 conviction = max(30, conviction - 30)
+            sl_pct, tp_pct, sl_price, tp_price = calc_dynamic_sl_tp(
+                "long", a["mark"], funding, a["chg24h"], "funding_squeeze_long")
             signals.append({
                 "strategy": "funding_squeeze_long",
                 "asset": a["name"],
@@ -127,9 +185,11 @@ def scan_funding_extremes(assets, threshold=0.03):
                 "chg_24h": a["chg24h"],
                 "rationale": f"Funding deeply negative ({funding:.4f}%), shorts paying longs. "
                            f"Crowded short positioning with ${oi_usd:,.0f} OI. Squeeze potential.",
-                "entry": "market or limit at current mark",
-                "stop_pct": 3.0,
-                "tp_pct": 6.0,
+                "entry": a["mark"],
+                "stop_pct": sl_pct,
+                "tp_pct": tp_pct,
+                "stop_price": sl_price,
+                "tp_price": tp_price,
             })
         
         # Positive funding extreme — short opportunity  
@@ -137,6 +197,8 @@ def scan_funding_extremes(assets, threshold=0.03):
             conviction = min(90, 50 + abs(funding) * 500 + (oi_usd / 10_000_000) * 10)
             if a["chg24h"] < -8:
                 conviction = max(30, conviction - 30)
+            sl_pct, tp_pct, sl_price, tp_price = calc_dynamic_sl_tp(
+                "short", a["mark"], funding, a["chg24h"], "funding_squeeze_short")
             signals.append({
                 "strategy": "funding_squeeze_short",
                 "asset": a["name"],
@@ -150,9 +212,11 @@ def scan_funding_extremes(assets, threshold=0.03):
                 "chg_24h": a["chg24h"],
                 "rationale": f"Funding elevated ({funding:.4f}%), longs paying shorts. "
                            f"Crowded long positioning with ${oi_usd:,.0f} OI. Correction risk.",
-                "entry": "market or limit at current mark",
-                "stop_pct": 3.0,
-                "tp_pct": 6.0,
+                "entry": a["mark"],
+                "stop_pct": sl_pct,
+                "tp_pct": tp_pct,
+                "stop_price": sl_price,
+                "tp_price": tp_price,
             })
     
     return signals
@@ -188,6 +252,8 @@ def scan_oi_volume_divergence(assets, prev_assets):
         
         # Leverage flush detection: OI down significantly + price down = liquidation cascade
         if oi_change_pct < -5 and a["chg24h"] < -3:
+            sl_pct, tp_pct, sl_price, tp_price = calc_dynamic_sl_tp(
+                "long", a["mark"], a["funding8h"], a["chg24h"], "leverage_flush_reversal")
             signals.append({
                 "strategy": "leverage_flush_reversal",
                 "asset": name,
@@ -201,13 +267,17 @@ def scan_oi_volume_divergence(assets, prev_assets):
                 "vol_24h": a["vol24h"],
                 "rationale": f"OI dropped {oi_change_pct:.1f}% while price fell {a['chg24h']:.1f}%. "
                            f"Leverage flush — longs liquidated. Mean reversion setup.",
-                "entry": "limit at current mark or slightly below",
-                "stop_pct": 2.5,
-                "tp_pct": 5.0,
+                "entry": a["mark"],
+                "stop_pct": sl_pct,
+                "tp_pct": tp_pct,
+                "stop_price": sl_price,
+                "tp_price": tp_price,
             })
         
         # Reverse: OI down + price up = shorts covering (squeeze in progress)
         elif oi_change_pct < -5 and a["chg24h"] > 3:
+            sl_pct, tp_pct, sl_price, tp_price = calc_dynamic_sl_tp(
+                "long", a["mark"], a["funding8h"], a["chg24h"], "short_squeeze_momentum")
             signals.append({
                 "strategy": "short_squeeze_momentum",
                 "asset": name,
@@ -221,9 +291,11 @@ def scan_oi_volume_divergence(assets, prev_assets):
                 "vol_24h": a["vol24h"],
                 "rationale": f"OI dropped {oi_change_pct:.1f}% while price rose {a['chg24h']:.1f}%. "
                            f"Shorts covering/squeezed. Momentum continuation.",
-                "entry": "limit slightly above current mark",
-                "stop_pct": 3.0,
-                "tp_pct": 8.0,
+                "entry": a["mark"],
+                "stop_pct": sl_pct,
+                "tp_pct": tp_pct,
+                "stop_price": sl_price,
+                "tp_price": tp_price,
             })
     
     return signals
@@ -240,6 +312,8 @@ def scan_large_moves(assets, move_threshold=8):
         if abs(a["chg24h"]) >= move_threshold:
             # Large move down with negative funding = potential bottom
             if a["chg24h"] < -move_threshold and a["funding8h"] < -0.005:
+                sl_pct, tp_pct, sl_price, tp_price = calc_dynamic_sl_tp(
+                    "long", a["mark"], a["funding8h"], a["chg24h"], "capitulation_reversal")
                 signals.append({
                     "strategy": "capitulation_reversal",
                     "asset": a["name"],
@@ -252,9 +326,11 @@ def scan_large_moves(assets, move_threshold=8):
                     "vol_24h": a["vol24h"],
                     "rationale": f"Down {a['chg24h']:.1f}% in 24h with negative funding ({a['funding8h']:.4f}%). "
                                f"Capitulation selling — oversold bounce candidate.",
-                    "entry": "scale in: 50% now, 50% on further -3%",
-                    "stop_pct": 5.0,
-                    "tp_pct": 10.0,
+                    "entry": a["mark"],
+                    "stop_pct": sl_pct,
+                    "tp_pct": tp_pct,
+                    "stop_price": sl_price,
+                    "tp_price": tp_price,
                 })
     
     return signals
@@ -272,6 +348,8 @@ def scan_premium_divergence(assets):
         premium = a["premium"]  # already in %
         
         if premium < -0.15:  # significant discount (tightened from -0.05)
+            sl_pct, tp_pct, sl_price, tp_price = calc_dynamic_sl_tp(
+                "long", a["mark"], a["funding8h"], a["chg24h"], "premium_discount_long")
             signals.append({
                 "strategy": "premium_discount_long",
                 "asset": a["name"],
@@ -280,27 +358,50 @@ def scan_premium_divergence(assets):
                 "premium_pct": premium,
                 "funding_8h": a["funding8h"],
                 "mark": a["mark"],
+                "chg_24h": a["chg24h"],
                 "oi_usd": a["oiUsd"],
+                "vol_24h": a["vol24h"],
                 "rationale": f"Perp trading at {premium:.4f}% discount to spot. "
                            f"Mispricing — expect convergence.",
-                "entry": "limit at current mark",
-                "stop_pct": 2.0,
-                "tp_pct": 3.0,
+                "entry": a["mark"],
+                "stop_pct": sl_pct,
+                "tp_pct": tp_pct,
+                "stop_price": sl_price,
+                "tp_price": tp_price,
             })
     
     return signals
 
+def format_price(price):
+    """Format price smartly based on magnitude."""
+    if price >= 1000:
+        return f"${price:,.2f}"
+    elif price >= 1:
+        return f"${price:,.4f}"
+    else:
+        return f"${price:,.6f}"
+
 def format_signal_discord(signal):
-    """Format a signal for Discord message."""
+    """Format a single signal as a standalone Discord message for individual reactions."""
     emoji = "🟢" if signal["direction"] == "long" else "🔴"
+    mark = signal["mark"]
+    chg = signal.get("chg_24h", signal.get("price_change", "N/A"))
+    
+    entry_price = format_price(signal["entry"]) if isinstance(signal["entry"], (int, float)) else signal["entry"]
+    sl_price = format_price(signal["stop_price"]) if "stop_price" in signal else "N/A"
+    tp_price = format_price(signal["tp_price"]) if "tp_price" in signal else "N/A"
+    
     return (
-        f"{emoji} **{signal['strategy'].upper().replace('_', ' ')}** — {signal['asset']}\n"
-        f"Direction: **{signal['direction'].upper()}** | Conviction: {signal['signal_strength']}/100\n"
-        f"Mark: ${signal['mark']:,.4f} | 24h: {signal.get('chg_24h', signal.get('price_change', 'N/A'))}%\n"
-        f"Funding (8h): {signal['funding_8h']:.4f}% | OI: ${signal['oi_usd']:,.0f}\n"
-        f"Rationale: {signal['rationale']}\n"
-        f"Entry: {signal['entry']}\n"
-        f"Stop: -{signal['stop_pct']}% | TP: +{signal['tp_pct']}%\n"
+        f"{emoji} **{signal['asset']}** — **{signal['direction'].upper()}** "
+        f"({signal['strategy'].replace('_', ' ').title()})\n"
+        f"Conviction: **{signal['signal_strength']}/100**\n"
+        f"Entry: {entry_price} | 24h: {chg}%\n"
+        f"🛑 SL: {sl_price} (-{signal['stop_pct']}%) | "
+        f"🎯 TP: {tp_price} (+{signal['tp_pct']}%) | "
+        f"R:R = 1:{round(signal['tp_pct']/signal['stop_pct'], 1)}\n"
+        f"Funding: {signal['funding_8h']:.4f}% | OI: ${signal['oi_usd']:,.0f}\n"
+        f"{signal['rationale']}\n"
+        f"👍 Approve  👎 Skip"
     )
 
 def format_trade_request(signal, require_approval=True):
@@ -343,6 +444,16 @@ def run_scan():
     all_signals.extend(scan_oi_volume_divergence(assets, prev_assets))
     all_signals.extend(scan_large_moves(assets, move_threshold=8))
     all_signals.extend(scan_premium_divergence(assets))
+    
+    # Deduplicate: keep highest conviction signal per asset
+    seen = {}
+    deduped = []
+    for sig in all_signals:
+        key = sig["asset"]
+        if key not in seen or sig["signal_strength"] > seen[key]["signal_strength"]:
+            seen[key] = sig
+    deduped = list(seen.values())
+    all_signals = deduped
     
     # Sort by signal strength
     all_signals.sort(key=lambda x: x["signal_strength"], reverse=True)
